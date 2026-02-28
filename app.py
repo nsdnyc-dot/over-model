@@ -13,13 +13,16 @@ DEFAULT_LOOKBACK_DAYS = 200
 LAST_N_MATCHES = 10
 
 # Common league IDs (Sportmonks league IDs can vary by product/version; keep editable)
-LEAGUES = {
-    "Premier League (England)": 8,
-    "Serie A (Italy)": 384,
-    "La Liga (Spain)": 564,
-    "Bundesliga (Germany)": 82,
-    "Ligue 1 (France)": 301,
-}
+def get_all_leagues(token):
+    data = sm_get("leagues", token)
+    return data.get("data", [])
+
+leagues_data = get_all_leagues(token)
+
+league_options = {l["name"]: l["id"] for l in leagues_data}
+
+league_name = st.selectbox("League", list(league_options.keys()))
+league_id = league_options[league_name]
 
 # ----------------------------
 # Helpers
