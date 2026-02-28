@@ -29,9 +29,41 @@ def sm_get(path: str, api_key: str, params: dict | None = None):
     return r.json()
 
 def find_team(api_key: str, team_name: str):
-    # Get teams list (first 500)
-    data = sm_get("teams", api_key, {"per_page": 500})
-    teams = data.get("data", [])
+    q = team_name.strip()
+
+    # 1) Try official search endpoint
+    try:
+        data = sm_get(f"teams/search/{q}", api_key)
+        teams = data.get("data", [])
+        if teams:
+            return teams[0]["id"], teams[0]["name"]
+    except Exception:
+        pass
+
+    # 2) Try filters search (some Sportmonks accounts support this)
+    try:
+        data = sm_get("teams", api_key, {"filters": f"search:{q}", "per_page": 50})
+        teams = data.get("data", [])
+        if teams:
+            return teams[0]["id"], teams[0]["name"]
+    except Exception:
+        pass
+
+    # 3) Fallback: paginate teams list and do substring match
+    # (This is slower but works even when search endpoints are limited)
+    for page in range(1, 26):  # up to 25 pages
+        data = sm_get("teams", api_key, {"per_page": 100, "page": page})
+        teams = data.get("data", [])
+        if not teams:
+            break
+
+        for t in teams:
+            name = (t.get("name") or "").lower()
+            if q.lower() in name:
+                return t["id"], t["name"]
+
+    st.error(f"Team not found: {team_name}")
+    st.stop()
 
     for team in teams:
         if team_name.lower() in team["name"].lower():
