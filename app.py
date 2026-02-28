@@ -1,352 +1,544 @@
 import os
-import difflib
+import math
+import datetime as dt
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import requests
 import streamlit as st
-from datetime import date
-from math import exp, factorial
+
 
 # ----------------------------
-# Config
+# CONFIG
 # ----------------------------
 BASE_URL = "https://api.sportmonks.com/v3/football"
-DEFAULT_LOOKBACK_DAYS = 200
-LAST_N_MATCHES = 10
+TOKEN_ENV_KEYS = ["SPORTMONKS_API_TOKEN", "SPORTMONKS_TOKEN", "SPORTMONKS_API_KEY"]
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def get_api_token() -> str:
-    # Streamlit Cloud: App → Settings → Secrets
-    # Add: SPORTMONKS_API_TOKEN="..."
+def get_token() -> Optional[str]:
+    # Streamlit secrets first
     if "SPORTMONKS_API_TOKEN" in st.secrets:
-        return str(st.secrets["SPORTMONKS_API_TOKEN"]).strip()
-    return os.getenv("SPORTMONKS_API_TOKEN", "").strip()
+        return st.secrets["SPORTMONKS_API_TOKEN"]
+    # Env fallback
+    for k in TOKEN_ENV_KEYS:
+        v = os.getenv(k)
+        if v:
+            return v
+    return None
 
 
-def sm_get(path: str, token: str, params: dict | None = None) -> dict:
+# ----------------------------
+# HTTP HELPERS
+# ----------------------------
+def sm_get(path: str, token: str, params: Optional[Dict] = None) -> Dict:
+    """GET wrapper with clean error messages."""
     if params is None:
         params = {}
-    params = {**params, "api_token": token}
+    params = dict(params)
+    params["api_token"] = token
 
     url = f"{BASE_URL}/{path.lstrip('/')}"
     r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+
+    # Keep a small debug payload for Streamlit display
+    debug = {
+        "url": r.url,
+        "status": r.status_code,
+    }
+
+    try:
+        j = r.json()
+    except Exception:
+        j = {"raw_text": r.text[:1000]}
+
+    if r.status_code >= 400:
+        # Raise with info
+        msg = j.get("message") if isinstance(j, dict) else None
+        raise requests.HTTPError(
+            f"Sportmonks HTTP {r.status_code}. {msg or 'Request failed.'}",
+            response=r,
+        )
+
+    # attach debug (non-sportmonks standard)
+    if isinstance(j, dict):
+        j["_debug"] = debug
+    return j
 
 
-def get_all_leagues(token: str) -> list[dict]:
-    """
-    Pulls all leagues available to your Sportmonks plan (paged).
-    """
-    leagues = []
-    page = 1
-    while True:
-        data = sm_get("leagues", token, params={"page": page})
-        chunk = data.get("data", []) or []
-        leagues.extend(chunk)
-
-        pagination = data.get("pagination") or {}
-        # If API doesn't return pagination, stop.
-        if not pagination:
-            break
-
-        if pagination.get("has_more") is True:
-            page += 1
-            continue
-
-        break
-
-    return leagues
+# ----------------------------
+# ODDS HELPERS
+# ----------------------------
+def american_to_implied_prob(american: int) -> float:
+    """Convert American odds to implied probability (no vig removal)."""
+    if american == 0:
+        return 0.0
+    if american < 0:
+        return (-american) / ((-american) + 100.0)
+    return 100.0 / (american + 100.0)
 
 
-def find_season_id_for_year(token: str, league_id: int, season_year: int) -> int | None:
-    """
-    Uses league endpoint with include=seasons, then picks the season whose 'starting_at' year matches.
-    """
-    data = sm_get(f"leagues/{league_id}", token, params={"include": "seasons"})
-    league = data.get("data") or {}
-
-    seasons = league.get("seasons") or []
-
-    # Some responses put included objects elsewhere; keep simple:
-    if not seasons and "included" in data:
-        included = data.get("included", []) or []
-        # seasons often have type = "season"
-        seasons = [x for x in included if str(x.get("type", "")).lower() == "season"]
-
-    for s in seasons:
-        starting_at = s.get("starting_at") or ""
-        if isinstance(starting_at, str) and len(starting_at) >= 4:
-            try:
-                if int(starting_at[:4]) == int(season_year):
-                    return int(s["id"])
-            except Exception:
-                pass
-
-        name = str(s.get("name", ""))
-        if str(season_year) in name:
-            return int(s["id"])
-
-    return None
-
-
-def get_teams_by_season(token: str, season_id: int) -> list[dict]:
-    """
-    Correct endpoint: teams by season id
-    """
-    data = sm_get(f"teams/seasons/{season_id}", token)
-    return data.get("data", []) or []
-
-
-def best_team_match(teams: list[dict], user_text: str) -> dict | None:
-    if not user_text.strip():
-        return None
-
-    names = []
-    key_to_team = {}
-
-    for t in teams:
-        name = str(t.get("name", "")).strip()
-        short_code = str(t.get("short_code", "")).strip()
-
-        for k in [name, short_code]:
-            if k:
-                low = k.lower()
-                names.append(low)
-                key_to_team[low] = t
-
-    query = user_text.strip().lower()
-
-    if query in key_to_team:
-        return key_to_team[query]
-
-    matches = difflib.get_close_matches(query, names, n=5, cutoff=0.55)
-    if matches:
-        return key_to_team[matches[0]]
-
-    contains = [k for k in names if query in k]
-    if contains:
-        return key_to_team[contains[0]]
-
-    return None
-
-
-def american_to_implied_prob(odds: int) -> float:
-    if odds < 0:
-        return (-odds) / ((-odds) + 100.0)
-    return 100.0 / (odds + 100.0)
-
-
+# ----------------------------
+# POISSON HELPERS
+# ----------------------------
 def poisson_pmf(k: int, lam: float) -> float:
-    return (exp(-lam) * (lam ** k)) / factorial(k)
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
-def prob_total_over_2_5(lam_total: float) -> float:
-    # P(Total goals >= 3) = 1 - (P0 + P1 + P2)
-    p0 = poisson_pmf(0, lam_total)
-    p1 = poisson_pmf(1, lam_total)
-    p2 = poisson_pmf(2, lam_total)
+def prob_over_25_from_lambda(lam: float) -> float:
+    """
+    Total goals ~ Poisson(lam).
+    Over 2.5 = P(G >= 3) = 1 - (P0 + P1 + P2)
+    """
+    if lam <= 0:
+        return 0.0
+    p0 = poisson_pmf(0, lam)
+    p1 = poisson_pmf(1, lam)
+    p2 = poisson_pmf(2, lam)
     return max(0.0, min(1.0, 1.0 - (p0 + p1 + p2)))
 
 
-def get_last_fixtures_for_team(token: str, team_id: int, lookback_days: int, league_id: int | None) -> list[dict]:
-    """
-    Pull fixtures for a team over a date range, then filter to those with results.
-    """
-    end = date.today()
-    start = end.fromordinal(end.toordinal() - lookback_days)
-
-    data = sm_get(
-        f"fixtures/between/{start.isoformat()}/{end.isoformat()}/{team_id}",
-        token,
-        params={"include": "participants;scores"},
-    )
-    fixtures = data.get("data", []) or []
-
-    filtered = []
-    for fx in fixtures:
-        if league_id is not None and int(fx.get("league_id", -1)) != int(league_id):
-            continue
-
-        scores = fx.get("scores") or []
-        if fx.get("result_info") or scores:
-            filtered.append(fx)
-
-    # newest first
-    filtered.sort(key=lambda x: x.get("starting_at") or "", reverse=True)
-    return filtered[:LAST_N_MATCHES]
+# ----------------------------
+# SPORTMONKS DATA PARSING
+# ----------------------------
+@dataclass
+class League:
+    id: int
+    name: str
+    country: str
 
 
-def goals_for_against_from_fixture(fx: dict, team_id: int) -> tuple[int, int] | None:
-    participants = fx.get("participants") or []
-    scores = fx.get("scores") or []
+@dataclass
+class Season:
+    id: int
+    name: str
+    year: Optional[int]
+    starting_at: Optional[str]
+    is_current: bool
 
-    home_id = None
-    away_id = None
-    for p in participants:
-        meta = p.get("meta") or {}
-        loc = meta.get("location")
-        if loc == "home":
-            home_id = int(p.get("id"))
-        elif loc == "away":
-            away_id = int(p.get("id"))
 
-    if home_id is None or away_id is None:
-        return None
+def safe_get(d: Dict, *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
-    ft = None
-    for s in scores:
-        desc = str(s.get("description", "")).lower()
-        if "full" in desc or "ft" in desc:
-            ft = s
+
+@st.cache_data(ttl=3600)
+def fetch_leagues(token: str) -> List[League]:
+    # Per Sportmonks, leagues endpoint is core; we keep it simple and paginate if needed.
+    # Many plans return a manageable list.
+    out: List[League] = []
+    page = 1
+    while True:
+        j = sm_get("leagues", token, params={"page": page})
+        data = j.get("data", [])
+        if not data:
             break
-    if ft is None and scores:
-        ft = scores[-1]
+        for row in data:
+            out.append(
+                League(
+                    id=int(row["id"]),
+                    name=str(row.get("name", "")),
+                    country=str(row.get("country", {}).get("name", "")) if isinstance(row.get("country"), dict) else str(row.get("country_name", "")),
+                )
+            )
+        pagination = j.get("pagination") or j.get("meta", {}).get("pagination")
+        if isinstance(pagination, dict):
+            has_more = pagination.get("has_more")
+            if has_more is False:
+                break
+        # fallback: if less than typical page size, stop
+        if len(data) < 25:
+            break
+        page += 1
+        if page > 30:
+            break
+    # remove empty names
+    out = [l for l in out if l.name]
+    return out
 
-    if not ft:
+
+@st.cache_data(ttl=3600)
+def fetch_seasons_for_league(token: str, league_id: int) -> List[Season]:
+    """
+    Use /seasons with filter on league.
+    Docs: seasons endpoints provide Season ID, Name, League ID, Year, Active.  [oai_citation:1‡docs.sportmonks.com](https://docs.sportmonks.com/v3/endpoints-and-entities/endpoints/seasons?utm_source=chatgpt.com)
+    """
+    seasons: List[Season] = []
+    page = 1
+    while True:
+        j = sm_get(
+            "seasons",
+            token,
+            params={
+                "page": page,
+                "filters": f"seasonLeagues:{league_id}",
+            },
+        )
+        data = j.get("data", [])
+        if not data:
+            break
+
+        for s in data:
+            seasons.append(
+                Season(
+                    id=int(s["id"]),
+                    name=str(s.get("name", "")),
+                    year=int(s["year"]) if s.get("year") not in (None, "") else None,
+                    starting_at=s.get("starting_at"),
+                    is_current=bool(s.get("is_current", False)),
+                )
+            )
+
+        pagination = j.get("pagination") or j.get("meta", {}).get("pagination")
+        if isinstance(pagination, dict) and pagination.get("has_more") is False:
+            break
+        if len(data) < 25:
+            break
+        page += 1
+        if page > 50:
+            break
+
+    # Sort newest first by year/starting_at
+    def sort_key(x: Season):
+        y = x.year or 0
+        return (y, x.starting_at or "")
+
+    seasons.sort(key=sort_key, reverse=True)
+    return seasons
+
+
+def normalize_name(s: str) -> str:
+    return "".join(ch.lower() for ch in s.strip() if ch.isalnum() or ch.isspace()).strip()
+
+
+def best_fuzzy_match(target: str, options: List[str]) -> Optional[str]:
+    """
+    Light fuzzy match without extra libraries.
+    Strategy: exact (normalized) contains / startswith, else token overlap.
+    """
+    t = normalize_name(target)
+    if not t:
+        return None
+    norm_opts = [(opt, normalize_name(opt)) for opt in options]
+
+    # exact
+    for opt, n in norm_opts:
+        if n == t:
+            return opt
+
+    # startswith
+    for opt, n in norm_opts:
+        if n.startswith(t) or t.startswith(n):
+            return opt
+
+    # contains
+    for opt, n in norm_opts:
+        if t in n or n in t:
+            return opt
+
+    # token overlap
+    tset = set(t.split())
+    best = None
+    best_score = 0
+    for opt, n in norm_opts:
+        oset = set(n.split())
+        score = len(tset & oset)
+        if score > best_score:
+            best_score = score
+            best = opt
+    return best if best_score > 0 else None
+
+
+@st.cache_data(ttl=900)
+def fetch_fixtures_for_season(token: str, season_id: int, lookback_days: int) -> List[Dict]:
+    """
+    Pull finished fixtures for a season within lookback window.
+    Use /fixtures + filters (Sportmonks supports filtering fixtures by leagues etc).  [oai_citation:2‡docs.sportmonks.com](https://docs.sportmonks.com/v3/endpoints-and-entities/endpoints/fixtures/get-all-fixtures?utm_source=chatgpt.com)
+    We'll filter by season using fixtureSeasons.
+    """
+    end = dt.date.today()
+    start = end - dt.timedelta(days=lookback_days)
+
+    fixtures: List[Dict] = []
+    page = 1
+    while True:
+        j = sm_get(
+            "fixtures",
+            token,
+            params={
+                "page": page,
+                "include": "participants;scores",
+                "filters": f"fixtureSeasons:{season_id}",
+                # Date filters can be plan-dependent; we still apply if supported.
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+            },
+        )
+        data = j.get("data", [])
+        if not data:
+            break
+
+        fixtures.extend(data)
+
+        pagination = j.get("pagination") or j.get("meta", {}).get("pagination")
+        if isinstance(pagination, dict) and pagination.get("has_more") is False:
+            break
+        if len(data) < 25:
+            break
+        page += 1
+        if page > 50:
+            break
+
+    # Keep only finished with scores present
+    finished = []
+    for fx in fixtures:
+        scores = fx.get("scores") or []
+        # If no scores array, skip
+        if not scores:
+            continue
+        finished.append(fx)
+    return finished
+
+
+def extract_total_goals_from_scores(fixture: Dict) -> Optional[int]:
+    """
+    Sportmonks scores format varies by include.
+    We try common patterns:
+      - scores entries with 'description' like 'CURRENT' or 'FT'
+      - scores entries per participant (home/away)
+    We’ll attempt robust extraction:
+      sum of participant scores at FT/Current.
+    """
+    scores = fixture.get("scores") or []
+    if not scores:
         return None
 
-    home_goals = (ft.get("score") or {}).get("home")
-    away_goals = (ft.get("score") or {}).get("away")
-    if home_goals is None or away_goals is None:
-        return None
+    # prefer CURRENT / FT-like scores
+    preferred = []
+    for s in scores:
+        desc = str(s.get("description", "")).upper()
+        if "CURRENT" in desc or "FT" in desc or "FULL" in desc:
+            preferred.append(s)
+    use = preferred if preferred else scores
 
-    home_goals = int(home_goals)
-    away_goals = int(away_goals)
+    # many responses have score 'score' dict with 'goals'
+    goals = []
+    for s in use:
+        sc = s.get("score")
+        if isinstance(sc, dict):
+            g = sc.get("goals")
+            if isinstance(g, int):
+                goals.append(g)
 
-    if int(team_id) == int(home_id):
-        return home_goals, away_goals
-    if int(team_id) == int(away_id):
-        return away_goals, home_goals
+    if goals:
+        # Often two entries: home and away goals
+        # If more entries exist, take last two
+        if len(goals) >= 2:
+            return int(goals[-1] + goals[-2])
+        return int(goals[0])
 
     return None
 
 
-def avg_goals_last_n(fixtures: list[dict], team_id: int) -> tuple[float, float] | None:
-    gf = []
-    ga = []
+def participant_names(fixture: Dict) -> List[str]:
+    parts = fixture.get("participants") or []
+    names = []
+    for p in parts:
+        name = p.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def find_team_ids_from_fixtures(fixtures: List[Dict]) -> Dict[str, int]:
+    """
+    Build map {team_name: team_id} from participants in fixtures.
+    """
+    m: Dict[str, int] = {}
     for fx in fixtures:
-        res = goals_for_against_from_fixture(fx, team_id)
-        if res is None:
-            continue
-        g_for, g_against = res
-        gf.append(g_for)
-        ga.append(g_against)
+        parts = fx.get("participants") or []
+        for p in parts:
+            pid = p.get("id")
+            pname = p.get("name")
+            if pid and pname and pname not in m:
+                m[str(pname)] = int(pid)
+    return m
 
-    if len(gf) < 3:
-        return None
 
-    return sum(gf) / len(gf), sum(ga) / len(ga)
+def filter_team_recent_fixtures(fixtures: List[Dict], team_id: int, n: int = 10) -> List[Dict]:
+    """
+    Take most recent N fixtures for a team (based on starting_at).
+    """
+    team_fx = []
+    for fx in fixtures:
+        parts = fx.get("participants") or []
+        ids = [p.get("id") for p in parts if isinstance(p, dict)]
+        if team_id in ids:
+            team_fx.append(fx)
+
+    def dt_key(fx: Dict):
+        s = fx.get("starting_at") or fx.get("starting_at_timestamp") or ""
+        return str(s)
+
+    team_fx.sort(key=dt_key, reverse=True)
+    return team_fx[:n]
+
+
+def estimate_lambda_from_recent(fixtures: List[Dict], home_id: int, away_id: int, n_each: int = 10) -> Tuple[float, Dict]:
+    """
+    Estimate expected total goals (lambda) from:
+      - last n fixtures for home team
+      - last n fixtures for away team
+    We take average total goals from each set, then average them.
+    """
+    h_fx = filter_team_recent_fixtures(fixtures, home_id, n=n_each)
+    a_fx = filter_team_recent_fixtures(fixtures, away_id, n=n_each)
+
+    def avg_totals(fxs: List[Dict]) -> Tuple[float, int, List[int]]:
+        totals = []
+        for fx in fxs:
+            tg = extract_total_goals_from_scores(fx)
+            if tg is not None:
+                totals.append(int(tg))
+        if not totals:
+            return (0.0, 0, [])
+        return (sum(totals) / len(totals), len(totals), totals)
+
+    h_avg, h_cnt, h_totals = avg_totals(h_fx)
+    a_avg, a_cnt, a_totals = avg_totals(a_fx)
+
+    # combine
+    usable = [x for x in [h_avg, a_avg] if x > 0]
+    lam = sum(usable) / len(usable) if usable else 0.0
+
+    debug = {
+        "home_fixtures_found": len(h_fx),
+        "away_fixtures_found": len(a_fx),
+        "home_totals_used": h_cnt,
+        "away_totals_used": a_cnt,
+        "home_avg_total_goals": h_avg,
+        "away_avg_total_goals": a_avg,
+        "lambda": lam,
+    }
+    return lam, debug
 
 
 # ----------------------------
-# UI
+# STREAMLIT UI
 # ----------------------------
 st.set_page_config(page_title="Over 2.5 Betting Model (Sportmonks)", layout="centered")
 st.title("Over 2.5 Betting Model (Sportmonks)")
-st.caption("Select league + season, enter teams + Over 2.5 American odds. Uses last 10 finished fixtures to estimate total goals, then Poisson for P(Over 2.5).")
+st.caption("Pick league + season, enter teams + Over 2.5 American odds. Uses recent finished fixtures to estimate λ and Poisson P(Over 2.5).")
 
-token = get_api_token()
+token = get_token()
 if not token:
-    st.error("Missing SPORTMONKS_API_TOKEN. Add it in Streamlit: App → Settings → Secrets, or set env var locally.")
+    st.error("Missing SPORTMONKS_API_TOKEN. Add it in Streamlit: App → Settings → Secrets as SPORTMONKS_API_TOKEN.")
     st.stop()
 
-# ---- Dynamic League Dropdown (no hardcoded IDs) ----
+# Leagues
 try:
-    leagues_data = get_all_leagues(token)
-except requests.HTTPError:
-    st.error("Could not load leagues from Sportmonks. Check your token/plan permissions.")
+    leagues = fetch_leagues(token)
+except Exception as e:
+    st.error(f"Could not load leagues. {e}")
     st.stop()
 
-if not leagues_data:
-    st.error("No leagues returned. Your Sportmonks plan may not allow listing leagues.")
+league_label_map = {f"{l.name} ({l.country})".strip(): l.id for l in leagues}
+league_choices = sorted(league_label_map.keys())
+
+league_choice = st.selectbox("League", league_choices, index=0)
+
+league_id = league_label_map[league_choice]
+
+# Seasons for league
+try:
+    seasons = fetch_seasons_for_league(token, league_id)
+except Exception as e:
+    st.error(f"Could not load seasons for league. {e}")
     st.stop()
 
-league_options = {}
-for l in leagues_data:
-    name = l.get("name", "Unknown")
-    country = (l.get("country") or {}).get("name")
-    label = f"{name} ({country})" if country else name
+if not seasons:
+    st.warning("No seasons returned for this league in your Sportmonks plan.")
+    st.stop()
+
+season_labels = []
+season_id_by_label = {}
+for s in seasons:
+    yr = f"{s.year}" if s.year else (s.starting_at[:4] if s.starting_at else "")
+    cur = " (current)" if s.is_current else ""
+    label = f"{s.name} — {yr}{cur}".strip()
+    season_labels.append(label)
+    season_id_by_label[label] = s.id
+
+season_choice = st.selectbox("Season", season_labels, index=0)
+season_id = season_id_by_label[season_choice]
+
+home_team = st.text_input("Home Team", value="Bournemouth")
+away_team = st.text_input("Away Team", value="Sunderland")
+american_odds = st.number_input("Over 2.5 American Odds", value=-110, step=5)
+
+lookback_days = st.slider("Lookback window (days) for finished fixtures", min_value=60, max_value=730, value=200, step=10)
+
+calc = st.button("Calculate", type="primary")
+
+if calc:
     try:
-        league_options[label] = int(l["id"])
-    except Exception:
-        continue
-
-league_label = st.selectbox("League", sorted(league_options.keys()))
-league_id = league_options[league_label]
-
-season_year = st.number_input("Season start year (YYYY)", min_value=2000, max_value=2100, value=2024, step=1)
-
-home_team_text = st.text_input("Home Team", value="Bournemouth")
-away_team_text = st.text_input("Away Team", value="Sunderland")
-odds = st.number_input("Over 2.5 American Odds", value=-110, step=1)
-
-lookback_days = st.slider("Lookback window (days) for fixtures", 60, 365, DEFAULT_LOOKBACK_DAYS)
-
-if st.button("Calculate"):
-    try:
-        season_id = find_season_id_for_year(token, int(league_id), int(season_year))
-        if not season_id:
-            st.error("Could not find season_id for that league + year. Try a different year (e.g., 2025) or pick the correct league in dropdown.")
-            st.stop()
-
-        teams = get_teams_by_season(token, int(season_id))
-        if not teams:
-            st.error("No teams returned for that season. Season_id might be wrong or your plan doesn’t include it.")
-            st.stop()
-
-        home_team = best_team_match(teams, home_team_text)
-        away_team = best_team_match(teams, away_team_text)
-
-        if not home_team:
-            st.error(f"Home team not found in that season: {home_team_text}")
-            st.stop()
-        if not away_team:
-            st.error(f"Away team not found in that season: {away_team_text}")
-            st.stop()
-
-        st.write(f"Matched Home: **{home_team.get('name')}** (team_id: {home_team.get('id')})")
-        st.write(f"Matched Away: **{away_team.get('name')}** (team_id: {away_team.get('id')})")
-
-        home_fx = get_last_fixtures_for_team(token, int(home_team["id"]), int(lookback_days), int(league_id))
-        away_fx = get_last_fixtures_for_team(token, int(away_team["id"]), int(lookback_days), int(league_id))
-
-        home_avgs = avg_goals_last_n(home_fx, int(home_team["id"]))
-        away_avgs = avg_goals_last_n(away_fx, int(away_team["id"]))
-
-        if not home_avgs or not away_avgs:
-            st.error("Not enough finished fixtures with usable scores. Increase lookback days or confirm league/season.")
-            st.stop()
-
-        home_gf, home_ga = home_avgs
-        away_gf, away_ga = away_avgs
-
-        st.subheader("Recent Form (Last 10 finished fixtures in selected league)")
-        st.write(f"**{home_team.get('name')}** — Avg Goals For: **{home_gf:.2f}**, Avg Goals Against: **{home_ga:.2f}**")
-        st.write(f"**{away_team.get('name')}** — Avg Goals For: **{away_gf:.2f}**, Avg Goals Against: **{away_ga:.2f}**")
-
-        # Expected goals (simple blend)
-        exp_home = (home_gf + away_ga) / 2.0
-        exp_away = (away_gf + home_ga) / 2.0
-        lam_total = max(0.05, exp_home + exp_away)
-
-        p_model = prob_total_over_2_5(lam_total)
-        p_market = american_to_implied_prob(int(odds))
-        edge = p_model - p_market
-
-        st.subheader("Model Output")
-        st.write(f"Expected Total Goals (λ): **{lam_total:.2f}**")
-        st.write(f"Model Probability Over 2.5: **{p_model*100:.2f}%**")
-        st.write(f"Market Implied Probability: **{p_market*100:.2f}%**")
-        st.write(f"Edge (Model − Market): **{edge*100:.2f}%**")
-
-        if edge > 0.02:
-            st.success("VALUE (positive edge)")
-        else:
-            st.warning("NO EDGE")
-
-    except requests.HTTPError as e:
-        st.error(f"HTTP error from Sportmonks: {str(e)}")
+        fixtures = fetch_fixtures_for_season(token, season_id, lookback_days)
     except Exception as e:
-        st.error(f"Unexpected error: {str(e)}")
+        st.error(f"Could not fetch fixtures. {e}")
+        st.stop()
+
+    if not fixtures:
+        st.error("No finished fixtures returned for this season in that lookback window.")
+        st.stop()
+
+    # Build team map from participants found in fixtures
+    name_to_id = find_team_ids_from_fixtures(fixtures)
+    options = list(name_to_id.keys())
+
+    home_match = best_fuzzy_match(home_team, options)
+    away_match = best_fuzzy_match(away_team, options)
+
+    if not home_match:
+        st.error(f"Home team not found in this league/season fixtures: {home_team}")
+        st.info("Tip: try the exact name Sportmonks uses (as shown in fixtures/participants).")
+        st.stop()
+
+    if not away_match:
+        st.error(f"Away team not found in this league/season fixtures: {away_team}")
+        st.info("Tip: try the exact name Sportmonks uses (as shown in fixtures/participants).")
+        st.stop()
+
+    home_id = name_to_id[home_match]
+    away_id = name_to_id[away_match]
+
+    st.caption(f"Matched Home: **{home_match}** (team_id: {home_id})")
+    st.caption(f"Matched Away: **{away_match}** (team_id: {away_id})")
+
+    lam, dbg = estimate_lambda_from_recent(fixtures, home_id, away_id, n_each=10)
+
+    if lam <= 0:
+        st.error("Not enough finished fixtures with usable scores for these teams in your lookback window.")
+        st.json(dbg)
+        st.stop()
+
+    model_p = prob_over_25_from_lambda(lam)
+    market_p = american_to_implied_prob(int(american_odds))
+    edge = model_p - market_p
+
+    st.subheader("Model Output")
+    st.write(f"**Expected Total Goals (λ):** {lam:.2f}")
+    st.write(f"**Model Probability Over 2.5:** {model_p*100:.2f}%")
+    st.write(f"**Market Implied Probability:** {market_p*100:.2f}%")
+    st.write(f"**Edge (Model − Market):** {edge*100:.2f}%")
+
+    if edge > 0.03:
+        st.success("EDGE ✅ (model > market by > 3%)")
+    else:
+        st.warning("NO EDGE (or too small)")
+
+    with st.expander("Debug details"):
+        st.json(dbg)
+        st.write(f"Fixtures fetched: {len(fixtures)}")
