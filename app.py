@@ -4,7 +4,7 @@ import streamlit as st
 
 BASE_URL = "https://api.sportmonks.com/v3/football"
 
-# ---- odds + poisson ----
+# ---------- odds + poisson ----------
 def american_to_prob(odds: float) -> float:
     odds = float(odds)
     if odds < 0:
@@ -18,7 +18,7 @@ def poisson_over_25(lam: float) -> float:
     p2 = (lam**2 / 2.0) * p0
     return 1.0 - (p0 + p1 + p2)
 
-# ---- sportmonks helpers ----
+# ---------- Sportmonks helpers ----------
 def sm_get(path: str, api_key: str, params: dict | None = None):
     if params is None:
         params = {}
@@ -28,51 +28,32 @@ def sm_get(path: str, api_key: str, params: dict | None = None):
     r.raise_for_status()
     return r.json()
 
-def find_team(api_key: str, team_name: str):
-    q = team_name.strip()
+# LEAGUE IDS (Sportmonks standard)
+LEAGUES = {
+    "Premier League (England)": 8,
+    "Championship (England)": 9,
+    "La Liga (Spain)": 564,
+    "Serie A (Italy)": 384,
+    "Bundesliga (Germany)": 82,
+    "Ligue 1 (France)": 301
+}
 
-    # 1) Try official search endpoint
-    try:
-        data = sm_get(f"teams/search/{q}", api_key)
-        teams = data.get("data", [])
-        if teams:
-            return teams[0]["id"], teams[0]["name"]
-    except Exception:
-        pass
+def find_team_in_league(api_key: str, league_id: int, team_name: str):
+    q = team_name.strip().lower()
 
-    # 2) Try filters search (some Sportmonks accounts support this)
-    try:
-        data = sm_get("teams", api_key, {"filters": f"search:{q}", "per_page": 50})
-        teams = data.get("data", [])
-        if teams:
-            return teams[0]["id"], teams[0]["name"]
-    except Exception:
-        pass
+    data = sm_get(f"leagues/{league_id}/teams", api_key)
+    teams = data.get("data", [])
 
-    # 3) Fallback: paginate teams list and do substring match
-    # (This is slower but works even when search endpoints are limited)
-    for page in range(1, 26):  # up to 25 pages
-        data = sm_get("teams", api_key, {"per_page": 100, "page": page})
-        teams = data.get("data", [])
-        if not teams:
-            break
+    for t in teams:
+        name = (t.get("name") or "").lower()
+        if q in name:
+            return t["id"], t["name"]
 
-        for t in teams:
-            name = (t.get("name") or "").lower()
-            if q.lower() in name:
-                return t["id"], t["name"]
-
-    st.error(f"Team not found: {team_name}")
+    st.error(f"Team not found in selected league: {team_name}")
     st.stop()
 
-    for team in teams:
-        if team_name.lower() in team["name"].lower():
-            return team["id"], team["name"]
-
-    st.error(f"Team not found: {team_name}")
-    st.stop()
 def last_n_fixtures(api_key: str, team_id: int, n: int = 10):
-    # pulls last N fixtures that include scores
+    # Pull last N fixtures for team (with scores)
     params = {
         "filters": f"team:{team_id}",
         "per_page": n,
@@ -98,7 +79,7 @@ def avg_goals_from_fixtures(fixtures: list, team_id: int):
         home_goals = None
         away_goals = None
 
-        # try FT first
+        # Prefer FT/final if available
         for s in scores:
             desc = (s.get("description") or "").upper()
             if "FT" in desc or "FINAL" in desc:
@@ -109,7 +90,7 @@ def avg_goals_from_fixtures(fixtures: list, team_id: int):
                 elif part == "away":
                     away_goals = goals
 
-        # fallback: any score
+        # Fallback: any score
         if home_goals is None or away_goals is None:
             for s in scores:
                 part = s.get("score", {}).get("participant")
@@ -135,10 +116,9 @@ def avg_goals_from_fixtures(fixtures: list, team_id: int):
 
     if games == 0:
         return 0.0, 0.0, 0
-
     return gf / games, ga / games, games
 
-# ---- app ----
+# ---------- Streamlit App ----------
 st.set_page_config(page_title="Over 2.5 Model (Sportmonks)", layout="centered")
 st.title("Over 2.5 Betting Model (Sportmonks)")
 
@@ -147,13 +127,16 @@ if not api_key:
     st.error("Missing SPORTMONKS_API_KEY in Streamlit Secrets.")
     st.stop()
 
+league_name = st.selectbox("League", list(LEAGUES.keys()), index=0)
+league_id = LEAGUES[league_name]
+
 home_team = st.text_input("Home Team", value="Bournemouth")
 away_team = st.text_input("Away Team", value="Sunderland")
 odds = st.number_input("Over 2.5 American Odds", value=-110, step=1)
 
 if st.button("Calculate"):
-    home_id, home_name = find_team(api_key, home_team.strip())
-    away_id, away_name = find_team(api_key, away_team.strip())
+    home_id, home_name = find_team_in_league(api_key, league_id, home_team)
+    away_id, away_name = find_team_in_league(api_key, league_id, away_team)
 
     home_fx = last_n_fixtures(api_key, home_id, n=10)
     away_fx = last_n_fixtures(api_key, away_id, n=10)
@@ -161,9 +144,13 @@ if st.button("Calculate"):
     home_gf, home_ga, home_n = avg_goals_from_fixtures(home_fx, home_id)
     away_gf, away_ga, away_n = avg_goals_from_fixtures(away_fx, away_id)
 
-    # lambda estimate (simple, goals-based)
-    home_exp = (home_gf + away_ga) / 2 if (home_n > 0 and away_n > 0) else 0.0
-    away_exp = (away_gf + home_ga) / 2 if (home_n > 0 and away_n > 0) else 0.0
+    # Simple lambda estimate using recent GF/GA
+    if home_n == 0 or away_n == 0:
+        st.error("Not enough recent fixtures with scores returned to calculate.")
+        st.stop()
+
+    home_exp = (home_gf + away_ga) / 2
+    away_exp = (away_gf + home_ga) / 2
     lam = home_exp + away_exp
 
     model_prob = poisson_over_25(lam)
