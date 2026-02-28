@@ -12,23 +12,36 @@ def american_to_prob(odds: float) -> float:
     return 100.0 / (odds + 100.0)
 
 def poisson_over_25(lam: float) -> float:
-    # P(X >= 3) for Poisson(lam)
     p0 = math.exp(-lam)
     p1 = lam * p0
     p2 = (lam**2 / 2.0) * p0
     return 1.0 - (p0 + p1 + p2)
 
 # ---------- Sportmonks helpers ----------
-def sm_get(path: str, api_key: str, params: dict | None = None):
+def sm_get_raw(path: str, api_key: str, params: dict | None = None):
     if params is None:
         params = {}
     params["api_token"] = api_key
     url = f"{BASE_URL}/{path}"
     r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    return r
 
-# LEAGUE IDS (Sportmonks standard)
+def sm_get_json_or_error(path: str, api_key: str, params: dict | None = None):
+    r = sm_get_raw(path, api_key, params)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw_text": r.text}
+
+    if r.status_code >= 400:
+        return None, {
+            "url": r.url,
+            "status": r.status_code,
+            "response": data
+        }
+    return data, None
+
+# LEAGUE IDS
 LEAGUES = {
     "Premier League (England)": 8,
     "Championship (England)": 9,
@@ -41,26 +54,61 @@ LEAGUES = {
 def find_team_in_league(api_key: str, league_id: int, team_name: str):
     q = team_name.strip().lower()
 
-    data = sm_get(f"leagues/{league_id}/teams", api_key)
-    teams = data.get("data", [])
+    # Method A: leagues/{id}/teams
+    data, err = sm_get_json_or_error(f"leagues/{league_id}/teams", api_key)
+    if data and isinstance(data.get("data"), list):
+        for t in data["data"]:
+            name = (t.get("name") or "").lower()
+            if q in name:
+                return t["id"], t["name"]
 
-    for t in teams:
-        name = (t.get("name") or "").lower()
-        if q in name:
-            return t["id"], t["name"]
+    # Method B: leagues/{id}?include=teams
+    data2, err2 = sm_get_json_or_error(f"leagues/{league_id}", api_key, {"include": "teams"})
+    # Some Sportmonks responses place included resources in "data" or "included"
+    teams = []
+    if data2:
+        if isinstance(data2.get("data"), dict):
+            # sometimes relationships stored differently; try common patterns
+            rel = data2["data"].get("teams") or data2["data"].get("relationships", {}).get("teams")
+            if isinstance(rel, list):
+                teams = rel
+        if not teams and isinstance(data2.get("included"), list):
+            teams = [x for x in data2["included"] if (x.get("type") == "team" or "name" in x)]
 
+    if teams:
+        for t in teams:
+            name = (t.get("name") or "").lower()
+            if q in name:
+                return t["id"], t["name"]
+
+    # If both methods failed, show the real API errors (no more guessing)
     st.error(f"Team not found in selected league: {team_name}")
+
+    st.subheader("Debug (why it failed)")
+    if err:
+        st.write("Method A failed:", err)
+    else:
+        st.write("Method A returned teams but no match for that name.")
+
+    if err2:
+        st.write("Method B failed:", err2)
+    else:
+        st.write("Method B returned data but no usable teams list or no match.")
+
     st.stop()
 
 def last_n_fixtures(api_key: str, team_id: int, n: int = 10):
-    # Pull last N fixtures for team (with scores)
     params = {
         "filters": f"team:{team_id}",
         "per_page": n,
         "sort": "-starting_at",
         "include": "scores"
     }
-    data = sm_get("fixtures", api_key, params=params)
+    data, err = sm_get_json_or_error("fixtures", api_key, params)
+    if err:
+        st.error("Fixtures endpoint failed.")
+        st.write(err)
+        st.stop()
     return data.get("data", [])
 
 def avg_goals_from_fixtures(fixtures: list, team_id: int):
@@ -79,7 +127,7 @@ def avg_goals_from_fixtures(fixtures: list, team_id: int):
         home_goals = None
         away_goals = None
 
-        # Prefer FT/final if available
+        # Prefer FT/final
         for s in scores:
             desc = (s.get("description") or "").upper()
             if "FT" in desc or "FINAL" in desc:
@@ -118,7 +166,7 @@ def avg_goals_from_fixtures(fixtures: list, team_id: int):
         return 0.0, 0.0, 0
     return gf / games, ga / games, games
 
-# ---------- Streamlit App ----------
+# ---------- Streamlit UI ----------
 st.set_page_config(page_title="Over 2.5 Model (Sportmonks)", layout="centered")
 st.title("Over 2.5 Betting Model (Sportmonks)")
 
@@ -144,7 +192,6 @@ if st.button("Calculate"):
     home_gf, home_ga, home_n = avg_goals_from_fixtures(home_fx, home_id)
     away_gf, away_ga, away_n = avg_goals_from_fixtures(away_fx, away_id)
 
-    # Simple lambda estimate using recent GF/GA
     if home_n == 0 or away_n == 0:
         st.error("Not enough recent fixtures with scores returned to calculate.")
         st.stop()
