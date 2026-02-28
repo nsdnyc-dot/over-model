@@ -29,14 +29,16 @@ def sm_get(path: str, api_key: str, params: dict | None = None):
     return r.json()
 
 def find_team(api_key: str, team_name: str):
-    data = sm_get(f"teams/search/{team_name}", api_key)
+    # Get teams list (first 500)
+    data = sm_get("teams", api_key, {"per_page": 500})
     teams = data.get("data", [])
-    if not teams:
-        st.error(f"Team not found: {team_name}")
-        st.stop()
-    # pick first match
-    return teams[0]["id"], teams[0]["name"]
 
+    for team in teams:
+        if team_name.lower() in team["name"].lower():
+            return team["id"], team["name"]
+
+    st.error(f"Team not found: {team_name}")
+    st.stop()
 def last_n_fixtures(api_key: str, team_id: int, n: int = 10):
     # pulls last N fixtures that include scores
     params = {
