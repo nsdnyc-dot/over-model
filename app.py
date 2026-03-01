@@ -2,113 +2,93 @@ import streamlit as st
 import requests
 import math
 
+st.set_page_config(page_title="Over 2.5 Model (FootyStats)", layout="centered")
+
+API_KEY = st.secrets["FOOTYSTATS_API_KEY"]
 BASE_URL = "https://api.football-data-api.com"
 
-st.set_page_config(page_title="Over 2.5 Model (FootyStats)", layout="centered")
 st.title("Over 2.5 Betting Model (FootyStats)")
 
-# Get API key from Streamlit Secrets
-API_KEY = st.secrets.get("FOOTYSTATS_API_KEY")
+# --------- Step 1: Search League ----------
+search = st.text_input("Search League (example: premier, mls, scotland)")
 
-if not API_KEY:
-    st.error("Missing FOOTYSTATS_API_KEY in Streamlit Secrets.")
-    st.stop()
+league_id = None
 
+if search:
+    res = requests.get(f"{BASE_URL}/league-list?key={API_KEY}")
+    leagues = res.json()["data"]
 
-def american_to_probability(odds):
-    if odds < 0:
-        return (-odds) / ((-odds) + 100)
+    filtered = [l for l in leagues if search.lower() in l["name"].lower()]
+
+    if filtered:
+        choice = st.selectbox("Select League Season", filtered, format_func=lambda x: f"{x['name']} ({x['season']})")
+        league_id = choice["id"]
     else:
-        return 100 / (odds + 100)
+        st.warning("No leagues found")
 
+# --------- Step 2: Load Teams ----------
+home_team = None
+away_team = None
 
-def poisson_over_2_5(lam):
-    p0 = math.exp(-lam)
-    p1 = p0 * lam
-    p2 = p1 * lam / 2
-    return 1 - (p0 + p1 + p2)
+if league_id:
+    team_res = requests.get(f"{BASE_URL}/league-teams?key={API_KEY}&league_id={league_id}")
+    teams = team_res.json()["data"]
 
+    team_names = [t["name"] for t in teams]
 
-league_id = st.number_input("League ID (season id)", value=1625)
-home_team_name = st.text_input("Home Team Name", "Manchester City")
-away_team_name = st.text_input("Away Team Name", "Liverpool")
+    home_team = st.selectbox("Home Team", team_names)
+    away_team = st.selectbox("Away Team", team_names)
+
+# --------- Step 3: Odds + Matches ----------
 odds = st.number_input("Over 2.5 American Odds", value=-110)
-lookback_matches = st.slider("Number of Matches to Use", 5, 30, 10)
+num_matches = st.slider("Number of Matches to Use", 5, 30, 10)
 
-if st.button("Calculate"):
-
-    # Get teams
-    teams_url = f"{BASE_URL}/league-teams"
-    teams_params = {"key": API_KEY, "league_id": league_id}
-    teams_response = requests.get(teams_url, params=teams_params)
-    teams_data = teams_response.json()
-
-    if not teams_data.get("success"):
-        st.error(teams_data.get("message", "API Error"))
-        st.stop()
-
-    teams = teams_data.get("data", [])
-
-    def find_team(name):
-        for t in teams:
-            if name.lower() in t.get("cleanName", "").lower():
-                return t
-        return None
-
-    home_team = find_team(home_team_name)
-    away_team = find_team(away_team_name)
-
-    if not home_team:
-        st.error("Home team not found in this league.")
-        st.stop()
-
-    if not away_team:
-        st.error("Away team not found in this league.")
-        st.stop()
-
-    st.write(f"Home ID: {home_team['id']}")
-    st.write(f"Away ID: {away_team['id']}")
-
-    # Get matches
-    matches_url = f"{BASE_URL}/league-matches"
-    matches_params = {"key": API_KEY, "league_id": league_id}
-    matches_response = requests.get(matches_url, params=matches_params)
-    matches_data = matches_response.json()
-
-    if not matches_data.get("success"):
-        st.error(matches_data.get("message", "API Error"))
-        st.stop()
-
-    matches = matches_data.get("data", [])
-
-    completed = [
-        m for m in matches
-        if m.get("status") == "complete"
-        and isinstance(m.get("totalGoalCount"), int)
-    ]
-
-    if len(completed) == 0:
-        st.error("No completed matches found.")
-        st.stop()
-
-    # Use recent matches
-    completed = sorted(completed, key=lambda x: x.get("date_unix", 0), reverse=True)
-    recent = completed[:lookback_matches]
-
-    total_goals = [m["totalGoalCount"] for m in recent]
-    lam = sum(total_goals) / len(total_goals)
-
-    model_prob = poisson_over_2_5(lam)
-    market_prob = american_to_probability(odds)
-    edge = model_prob - market_prob
-
-    st.subheader("Model Output")
-    st.write(f"Expected Goals (λ): {lam:.2f}")
-    st.write(f"Model Probability Over 2.5: {model_prob*100:.2f}%")
-    st.write(f"Market Implied Probability: {market_prob*100:.2f}%")
-    st.write(f"Edge: {edge*100:.2f}%")
-
-    if edge > 0.03:
-        st.success("EDGE FOUND")
+# --------- Step 4: Calculation ----------
+def american_to_prob(o):
+    if o > 0:
+        return 100 / (o + 100)
     else:
-        st.warning("No Edge")
+        return -o / (-o + 100)
+
+def poisson_prob(lam):
+    prob = 0
+    for i in range(3):
+        prob += (math.exp(-lam) * lam**i) / math.factorial(i)
+    return 1 - prob
+
+if st.button("Calculate") and league_id and home_team and away_team:
+
+    matches_res = requests.get(f"{BASE_URL}/league-matches?key={API_KEY}&league_id={league_id}")
+    matches = matches_res.json()["data"]
+
+    team_goals = []
+
+    for m in matches:
+        if m["status"] == "complete":
+            if m["home_name"] == home_team:
+                team_goals.append(m["homeGoalCount"])
+            if m["away_name"] == home_team:
+                team_goals.append(m["awayGoalCount"])
+
+    team_goals = team_goals[:num_matches]
+
+    if len(team_goals) < 5:
+        st.error("Not enough completed matches.")
+    else:
+        avg_goals = sum(team_goals) / len(team_goals)
+        lam = avg_goals * 2
+
+        model_prob = poisson_prob(lam)
+        market_prob = american_to_prob(odds)
+        edge = model_prob - market_prob
+
+        st.subheader("Model Output")
+        st.write("Expected Total Goals (λ):", round(lam,2))
+        st.write("Model Probability Over 2.5:", round(model_prob*100,2),"%")
+        st.write("Market Implied Probability:", round(market_prob*100,2),"%")
+        st.write("Edge:", round(edge*100,2),"%")
+
+        if edge > 0.03:
+            st.success("EDGE FOUND")
+        else:
+            st.warning("No Edge")
